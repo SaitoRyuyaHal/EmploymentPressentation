@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+
+import dbus
+import dbus.exceptions
+import dbus.mainloop.glib
+import dbus.service
+
+import array
+import sys
+import time
+
+from random import randint
+
+from BleApi import *
+from RaspberryPiDriver import GpioDriver
+from HumidityTempratureSensor import HumidityTemperatureDriver 
+from SoilSensor import SoilSensorDriver
+from ObserverPattern import Observer, Observable
+from Switch import SwitchDriver
+from AlarmClock import AlarmClock
+
+
+class SensorDeviceAdvertisement(Advertisement):
+    def __init__(self, bus, index):
+        Advertisement.__init__(self, bus, index, "peripheral")
+        self.add_local_name("SensorDevice")
+
+
+class Application(dbus.service.Object):
+    def __init__(self, bus):
+        self.path = '/'
+        self.services = []
+        dbus.service.Object.__init__(self, bus, self.path)
+        self.add_service(EnvironmentService(bus, 0))
+        self.add_service(VegetableInfoService(bus, 1))
+
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
+
+    def add_service(self, service):
+        self.services.append(service)
+
+    @dbus.service.method(DBUS_OM_IFACE, out_signature='a{oa{sa{sv}}}')
+    def GetManagedObjects(self):
+        response = {}
+        print('GetManagedObjects')
+
+        for service in self.services:
+            response[service.get_path()] = service.get_properties()
+            chrcs = service.get_characteristics()
+            for chrc in chrcs:
+                response[chrc.get_path()] = chrc.get_properties()
+                descs = chrc.get_descriptors()
+                for desc in descs:
+                    response[desc.get_path()] = desc.get_properties()
+
+        return response
+
+
+class EnvironmentService(Service):
+    ENVIRONMENT_UUID = "0b5a7b0d-de62-4acd-b61a-3c92989b3d1b"
+
+    def __init__(self, bus, index):
+        Service.__init__(self, bus, index, self.ENVIRONMENT_UUID, True)
+        self.temp_chr = TemperatureAndHumidityCharacteristic(bus, 0, self)
+        self.humidity_temperature_observable = HumidityTemperatureObservable()
+        self.humidity_temperature_observable.addObserver(self.temp_chr)
+        self.soil_chr = SoilCharacteristic(bus, 1, self)
+        self.soil_ovservable = SoilObservable()
+        self.soil_ovservable.addObserver(self.soil_chr)
+
+        self.add_characteristic(self.temp_chr)
+        self.add_characteristic(self.soil_chr)
+
+
+class LowPassFilter():
+    def __init__(self, threshold):
+        self.threshold = threshold
+        self.value = 0
+
+    def filter(self, value):
+        if (abs(value - self.value) > self.threshold):
+            k = 0.07
+        else:
+            k = 0.01
+        self.value += k * (value - self.value)
+        return self.value
+
+
+class RC_Filter:
+    def __init__(self, filter_performance = 0.5):
+        self.performance = filter_performance
+        self.rc = 0
+
+    def filter(self, value):
+        self.rc = self.performance * self.rc + (1 - self.performance) * value
+        return self.rc
+
+
+class SoilObservable(Observable):
+    def __init__(self):
+        super().__init__()
+        self.filter = RC_Filter(0.99)
+        self.soil = 0
+        self.last_soil = 0
+        alarm_clock = AlarmClock()
+        alarm_clock.add(500, self.check)
+        self.sensor = SoilSensorDriver(0)
+        gpio = GpioDriver()
+        self.sensor.setGpio(gpio)
+        self.sensor.setUp()
+
+    def setChanged(self):
+        self.last_soil = self.soil
+
+    def check(self):
+        self.soil = round(self.filter.filter(self.sensor.read()), 1)
+        if self.soil != self.last_soil:
+            self.setChanged()
+            self.notifyObservers()
+        return True
+
+
+class HumidityTemperatureObservable(Observable):
+    def __init__(self):
+        super().__init__()
+        self.temp_low_pass = LowPassFilter(15)
+        self.humidity_low_pass = LowPassFilter(15)
+        self.temperature = 0
+        self.humidity = 0
+        self.last_humidity = 0
+        self.last_temperature = 0
+        alarm_clock = AlarmClock()
+        alarm_clock.add(1500, self.check)
+        self.sensor = HumidityTemperatureDriver(16)
+        gpio = GpioDriver()
+        self.sensor.setGpio(gpio)
+        self.sensor.setUp()
+        self.temp_threshold = -7
+
+    def setChanged(self):
+        self.last_humidity = self.humidity
+        self.last_temperature = self.temperature
+
+    def check(self):
+        value = self.sensor.dataResponse() 
+        self.humidity = round(self.humidity_low_pass.filter(value["humidity"]), 1)
+        self.temperature = round(self.temp_low_pass.filter(
+            value["temperature"] + self.temp_threshold), 1)
+        if self.humidity != self.last_humidity or self.temperature != self.last_temperature:
+            self.setChanged()
+            self.notifyObservers()
+        return True
+
+
+class SoilCharacteristic(Characteristic, Observer):
+    SOIL_UUID = "34b89532-e914-4419-ba10-cb86effbdc0f"
+    def __init__(self, bus, index, service):
+        Characteristic.__init__(
+                self, bus, index,
+                self.SOIL_UUID,
+                ['read', 'notify'],
+                service)
+        Observer.__init__(self)
+        self.notifying = False
+        self.soil = 0
+
+    def update(self, model):
+        self.soil = model.last_soil
+        self.notify_temperature()
+
+    def notify_temperature(self):
+        if not self.notifying:
+            return 
+        print("Soil Value: " + repr(self.soil))
+        soil = int(self.soil * 10)
+        high_soil = (soil >> 8) & 0xff
+        low_soil = (soil & 0xff)
+        self.PropertiesChanged(
+                GATT_CHRC_IFACE,
+                {'Value': [dbus.Byte(high_soil), dbus.Byte(low_soil)]}, [])
+
+    def ReadValue(self, options):
+        print("Soil Value read: " + repr(self.soil))
+        soil = int(self.soil * 10)
+        high_soil = (soil >> 8) & 0xff
+        low_soil = (soil & 0xff)
+        return [dbus.Byte(high_soil), dbus.Byte(low_soil)]
+
+    def StartNotify(self):
+        if self.notifying:
+            print("Already notifying, nothing to do")
+            return
+
+        self.notifying = True
+        self.notify_temperature()
+
+    def StopNotify(self):
+        if not self.notifying:
+            print("Not notifying, nothing to do")
+            return
+
+        self.notifying = False
+
+
+class TemperatureAndHumidityCharacteristic(Characteristic, Observer):
+    TEMPERATURE_UUID = "efdcf900-469c-4a12-ab02-e0d56e3ecdaf"
+    def __init__(self, bus, index, service):
+        Characteristic.__init__(
+                self, bus, index,
+                self.TEMPERATURE_UUID,
+                ['read', 'notify'],
+                service)
+        Observer.__init__(self)
+        self.notifying = False
+        self.temperature = 0
+        self.humidity = 0
+
+    def update(self, model):
+        self.temperature = model.last_temperature
+        self.humidity = model.last_humidity
+        self.notify_temperature()
+
+    def notify_temperature(self):
+        if not self.notifying:
+            return 
+        print("Temperature Value: " + repr(self.temperature))
+        print("Humidity Value: " + repr(self.humidity))
+        temperature = int(self.temperature * 10)
+        humidity = int(self.humidity * 10)
+        high_temperature = (temperature >> 8) & 0xff
+        low_temperature = (temperature & 0xff)
+        high_humidity = (humidity >> 8) & 0xff
+        low_humidity = (humidity & 0xff)
+        self.PropertiesChanged(
+                GATT_CHRC_IFACE,
+                {'Value': [dbus.Byte(high_temperature), dbus.Byte(low_temperature),
+                           dbus.Byte(high_humidity), dbus.Byte(low_humidity)]}, [])
+
+    def ReadValue(self, options):
+        print("Temperature Value read: " + repr(self.temperature))
+        print("Humidity Value read: " + repr(self.humidity))
+        temperature = int(self.temperature * 10)
+        humidity = int(self.humidity * 10)
+        high_temperature = (temperature >> 8) & 0xff
+        low_temperature = (temperature & 0xff)
+        high_humidity = (humidity >> 8) & 0xff
+        low_humidity = (humidity & 0xff)
+        return [dbus.Byte(high_temperature), dbus.Byte(low_temperature),
+                dbus.Byte(high_humidity), dbus.Byte(low_humidity)]
+
+    def StartNotify(self):
+        if self.notifying:
+            print("Already notifying, nothing to do")
+            return
+
+        self.notifying = True
+        self.notify_temperature()
+
+    def StopNotify(self):
+        if not self.notifying:
+            print("Not notifying, nothing to do")
+            return
+
+        self.notifying = False
+
+class VegetableInfoService(Service):
+    VEGETABLEINFO_UUID =     "166d7eaa-25e7-11ea-978f-2e728ce88125"
+
+    def __init__(self, bus, index):
+        Service.__init__(self, bus, index, self.VEGETABLEINFO_UUID, True)
+        self.add_characteristic(VegetableRegisterCharacteristic(bus, 0, self))
+        
+
+class VegetableRegisterCharacteristic(Characteristic):
+    VEGETABLEREGISTER_UUID = "166d8120-25e7-11ea-978f-2e728ce88125"
+
+    def __init__(self, bus, index, service):
+        Characteristic.__init__(
+                self, bus, index,
+                self.VEGETABLEREGISTER_UUID,
+                ['write', 'read'],
+                service)
+        self.vegetable_info = 65535
+
+    def WriteValue(self, value, options):
+        print('Vegetable Register WriteValue called')
+
+        if len(value) != 2:
+            raise InvalidValueLengthException()
+
+        vegetable_info = (value[0] << 8) | value[1]
+        print("Vegetable Infomation Value: " + repr(vegetable_info))
+
+        self.vegetable_info = vegetable_info
+
+    def ReadValue(self, options):
+        high_vegetable_info = (self.vegetable_info >> 8) & 0xff
+        low_vegetable_info = (self.vegetable_info & 0xff)
+        return [dbus.Byte(high_vegetable_info), dbus.Byte(low_vegetable_info)]
+
+
+class AdvertisingSwitchStateObservable(Observable):
+    def __init__(self):
+        super().__init__()
+        alarm_clock = AlarmClock()
+        alarm_clock.add(1000, self.check)
+        self.switch = SwitchDriver(26)
+        self.switch.setGpio(GpioDriver())
+        self.switch.setUp()
+        alarm_clock.add(80, self.switch.sampling)
+        self.switch_state = 0
+        self.last_switch_state = 0
+
+    def setChanged(self):
+        self.last_switch_state = self.switch_state
+
+    def check(self):
+        self.switch_state = self.switch.read()
+        if self.last_switch_state != self.switch_state:
+            self.setChanged()
+            self.notifyObservers()
+        return True
+
+
+class AdvertisingObserver(Observer):
+    def __init__(self, bus):
+        super().__init__()
+        self.switch_state = 0
+        self.bus = bus
+        self.adapter = self.find_adapter(bus)
+        if self.adapter is None:
+            return
+        self.adapter_powered_on()
+        self.ad_manager = dbus.Interface(
+                self.bus.get_object(BLUEZ_SERVICE_NAME, self.adapter),
+                                    LE_ADVERTISING_MANAGER_IFACE)
+        self.advertisement = SensorDeviceAdvertisement(bus, 2)
+
+    def update(self, model):
+        self.switch_state = model.last_switch_state
+        self.notify_advertising()
+
+    def notify_advertising(self):
+        if self.switch_state == 1:
+            self.ad_manager.RegisterAdvertisement(self.advertisement.get_path(), {},
+                                                  reply_handler=self.register_ad_cb,
+                                                  error_handler=self.register_ad_error_cb)
+            print("RegisterAdvertisement")
+        else:
+            self.ad_manager.UnregisterAdvertisement(self.advertisement)
+            print("UnRegisterAdvertisement")
+
+    def adapter_powered_on(self):
+        adapter_props = dbus.Interface(self.bus.get_object(BLUEZ_SERVICE_NAME, 
+                                                           self.adapter),
+                                       "org.freedesktop.DBus.Properties")
+        adapter_props.Set("org.bluez.Adapter1", "Powered", dbus.Boolean(1))
+
+    def register_ad_cb(self):
+        print('Advertisement registered')
+
+    def register_ad_error_cb(self, error):
+        print('Failed to register advertisement: ' + str(error))
+        alarm_clock = AlarmClock()
+        alarm_clock.stop()
+
+    def find_adapter(self, bus):
+        remote_om = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, '/'),
+                                   DBUS_OM_IFACE)
+        objects = remote_om.GetManagedObjects()
+
+        for o, props in objects.items():
+            if LE_ADVERTISING_MANAGER_IFACE in props:
+                return o
+
+        print("LEAdvertisingManager1 interface not found")
+        return None
+
+
+
+class SensorDeviceGattServer:
+    def __init__(self):
+        self.bus = None
+        self.alarm_clock = AlarmClock()
+
+    def register_app_cb(self):
+        print("GATT application registered")
+
+    def register_app_error_cb(self, error):
+        print("Failed to register application: " + str(error))
+        self.alarm_clock.stop()
+
+    def find_gatt_manager_adapter(self, bus):
+        remote_om = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, '/'),
+                                   DBUS_OM_IFACE)
+        objects = remote_om.GetManagedObjects()
+
+        for o, props in objects.items():
+            if GATT_MANAGER_IFACE in props.keys():
+                return o
+
+        return None
+
+    def main(self):
+        self.alarm_clock.run()
+
+    def __enter__(self):
+        print("Sensor Device GattServer Start")
+        bus = dbus.SystemBus()
+        self.bus = bus
+
+        advertising_observable = AdvertisingSwitchStateObservable()
+        advertising_observer = AdvertisingObserver(bus)
+        advertising_observable.addObserver(advertising_observer)
+        gatt_manager_adapter = self.find_gatt_manager_adapter(bus)
+        if not gatt_manager_adapter:
+            print('GattManager1 interface not found')
+            return
+
+        service_manager = dbus.Interface(
+                bus.get_object(BLUEZ_SERVICE_NAME, gatt_manager_adapter),
+                GATT_MANAGER_IFACE)
+        app = Application(bus)
+        print('Registering GATT application...')
+        service_manager.RegisterApplication(app.get_path(), {},
+                                        reply_handler=self.register_app_cb,
+                                        error_handler=self.register_app_error_cb)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        print("ExcType: {0}".format(exc_type))
+        print("ExcValue: {0}".format(exc_value))
+        print("Traceback: {0}".format(traceback))
+        self.bus.close()
+        GpioDriver().close()
+        print("SensorDevice Gatt Server Close")
+
+
+if __name__ == '__main__':
+    with SensorDeviceGattServer() as gs:
+        gs.main()
